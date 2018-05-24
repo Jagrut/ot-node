@@ -21,12 +21,12 @@ before_script:
 script:
   # - which java && java -version
   # - which neo4j && neo4j version
-  - npm run lint
+  # - npm run lint
   - npm test
-  - npm start &>start.log &
-  - sleep 12
-  - jobs
-  - kill %1
+  # - npm start &>start.log &
+  # - sleep 12
+  # - jobs
+  # - kill %1
   # - node isStartHealthy.js
   # - ganache-cli -i 5777 -p 7545 &>ganache.log &
   # - cd modules/Blockchain/Ethereum && rm -rf build && truffle migrate --reset --compile-all --network ganache
