@@ -1,4 +1,3 @@
-const node = require('./Node');
 const config = require('./Config');
 const BN = require('bn.js');
 
@@ -18,6 +17,7 @@ class DHService {
     constructor(ctx) {
         this.importer = ctx.importer;
         this.blockchain = ctx.blockchain;
+        this.network = ctx.network;
     }
 
     /**
@@ -42,6 +42,34 @@ class DHService {
                 const offer = offerModel.get({ plain: true });
                 log.trace(`Mine offer (ID ${offer.data_hash}). Ignoring.`);
                 return;
+            }
+
+            // Check if predetermined bid was already added for me.
+            // Possible race condition here.
+            if (!predeterminedBid) {
+                // If event is in the table event will be handled on different call.
+                const eventModels = await Models.events.findAll({
+                    where: {
+                        offer_hash: offerHash,
+                        event: 'AddedPredeterminedBid',
+                    },
+                });
+
+                if (eventModels) {
+                    let found = false;
+                    eventModels.forEach((eventModel) => {
+                        const data = JSON.parse(eventModel.data);
+                        if (data.DH_node_id.substring(2, 42) === config.identity &&
+                            data.DH_wallet === config.node_wallet) {
+                            // I'm chosen for predetermined bid.
+                            found = true;
+                        }
+                    });
+
+                    if (found) {
+                        return;
+                    }
+                }
             }
 
             // Check if already applied.
@@ -145,7 +173,7 @@ class DHService {
 
             bidModel = await Models.bids.findOne({ where: { offer_hash: offerHash } });
             const bid = bidModel.get({ plain: true });
-            node.ot.replicationRequest(
+            this.network.kademlia().replicationRequest(
                 {
                     offer_hash: offerHash,
                     wallet: config.node_wallet,
@@ -162,7 +190,7 @@ class DHService {
         }
     }
 
-    static _saveBidToStorage(
+    _saveBidToStorage(
         event,
         dcNodeId,
         dcWallet,
@@ -227,7 +255,7 @@ class DHService {
             );
 
             log.important('Finished negotiation. Job starting. Waiting for challenges.');
-            node.ot.replicationFinished({ status: 'success' }, bid.dc_id);
+            this.network.kademlia().replicationFinished({ status: 'success' }, bid.dc_id);
         } catch (error) {
             log.error(`Failed to verify escrow. ${error}.`);
         }

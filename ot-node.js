@@ -8,7 +8,9 @@ const models = require('./models');
 const Storage = require('./modules/Storage');
 const Importer = require('./modules/importer');
 const GS1Importer = require('./modules/GS1Importer');
+const WOTImporter = require('./modules/WOTImporter');
 const config = require('./modules/Config');
+const Challenger = require('./modules/Challenger');
 const RemoteControl = require('./modules/RemoteControl');
 const corsMiddleware = require('restify-cors-middleware');
 
@@ -50,6 +52,17 @@ class OTNode {
         } catch (err) {
             console.log(err);
             process.exit(1);
+        }
+
+        // check if ArangoDB service is running at all
+        if (process.env.GRAPH_DATABASE === 'arangodb') {
+            try {
+                const responseFromArango = await Utilities.getArangoDbVersion();
+                log.info(`Arango server version ${responseFromArango.version} is up and running`);
+            } catch (err) {
+                log.error('Please make sure Arango server is runing before starting ot-node');
+                process.exit(1);
+            }
         }
 
         // sync models
@@ -129,25 +142,26 @@ class OTNode {
         });
 
         container.register({
-            emitter: awilix.asClass(EventEmitter),
-            network: awilix.asClass(Network),
-            graph: awilix.asClass(Graph),
-            product: awilix.asClass(Product),
-            dhService: awilix.asClass(DHService),
-            dcService: awilix.asClass(DCService),
+            emitter: awilix.asClass(EventEmitter).singleton(),
+            network: awilix.asClass(Network).singleton(),
+            graph: awilix.asClass(Graph).singleton(),
+            product: awilix.asClass(Product).singleton(),
+            dhService: awilix.asClass(DHService).singleton(),
+            dcService: awilix.asClass(DCService).singleton(),
             config: awilix.asValue(config),
-            importer: awilix.asClass(Importer),
-            blockchain: awilix.asClass(Blockchain),
-            dataReplication: awilix.asClass(DataReplication),
-            gs1Importer: awilix.asClass(GS1Importer),
+            importer: awilix.asClass(Importer).singleton(),
+            blockchain: awilix.asClass(Blockchain).singleton(),
+            dataReplication: awilix.asClass(DataReplication).singleton(),
+            gs1Importer: awilix.asClass(GS1Importer).singleton(),
+            wotImporter: awilix.asClass(WOTImporter).singleton(),
             graphStorage: awilix.asValue(new GraphStorage(selectedDatabase)),
+            remoteControl: awilix.asClass(RemoteControl).singleton(),
+            challenger: awilix.asClass(Challenger).singleton(),
         });
         const emitter = container.resolve('emitter');
         const dhService = container.resolve('dhService');
-        const dcService = container.resolve('dcService');
-        const dataReplication = container.resolve('dataReplication');
-        const importer = container.resolve('importer');
-        emitter.initialize(dcService, dhService, dataReplication, importer);
+        const remoteControl = container.resolve('remoteControl');
+        emitter.initialize();
 
         // Connecting to graph database
         const graphStorage = container.resolve('graphStorage');
@@ -177,16 +191,32 @@ class OTNode {
 
         if (parseInt(config.remote_control_enabled, 10)) {
             log.info(`Remote control enabled and listening on port ${config.remote_control_port}`);
-            await RemoteControl.connect();
+            await remoteControl.connect();
         }
 
         // Starting event listener on Blockchain
-        log.info('Starting blockchain event listener');
-        setInterval(() => {
-            blockchain.getAllPastEvents('BIDDING_CONTRACT');
-        }, 3000);
-
+        this.listenBlockchainEvents(blockchain);
         dhService.listenToOffers();
+    }
+
+    /**
+     * Listen to all Bidding events
+     * @param blockchain
+     */
+    listenBlockchainEvents(blockchain) {
+        log.info('Starting blockchain event listener');
+
+        const delay = 3000;
+        let working = false;
+        let deadline = Date.now();
+        setInterval(() => {
+            if (!working && Date.now() > deadline) {
+                working = true;
+                blockchain.getAllPastEvents('BIDDING_CONTRACT');
+                deadline = Date.now() + delay;
+                working = false;
+            }
+        }, 1000);
     }
 
     /**
@@ -277,9 +307,7 @@ class OTNode {
      * API Routes
      */
     exposeAPIRoutes(server, emitter) {
-        server.post('/import', (req, res) => {
-            log.important('Import request received!');
-
+        const authorize = (req, res) => {
             const request_ip = req.headers['x-forwarded-for'] || req.connection.remoteAddress;
             const remote_access = config.remote_access_whitelist;
 
@@ -288,6 +316,15 @@ class OTNode {
                     message: 'Unauthorized request',
                     data: [],
                 });
+                return false;
+            }
+            return true;
+        };
+
+        server.post('/import', (req, res) => {
+            log.important('Import request received!');
+
+            if (!authorize(req, res)) {
                 return;
             }
 
@@ -329,14 +366,7 @@ class OTNode {
         server.post('/import_gs1', (req, res) => {
             log.important('Import request received!');
 
-            const request_ip = req.headers['x-forwarded-for'] || req.connection.remoteAddress;
-            const remote_access = config.remote_access_whitelist;
-
-            if (remote_access.find(ip => Utilities.isIpEqual(ip, request_ip)) === undefined) {
-                res.send({
-                    message: 'Unauthorized request',
-                    data: [],
-                });
+            if (!authorize(req, res)) {
                 return;
             }
 
@@ -377,9 +407,34 @@ class OTNode {
             }
         });
 
+        server.post('/import_wot', (req, res) => {
+            log.important('Import request received!');
+
+            if (!authorize(req, res)) {
+                return;
+            }
+
+            const input_file = req.files.importfile.path;
+            const queryObject = {
+                filepath: input_file,
+                contact: req.contact,
+                response: res,
+            };
+
+            emitter.emit('wot-import-request', queryObject);
+        });
+
         server.get('/api/trail', (req, res) => {
             const queryObject = req.query;
             emitter.emit('trail', {
+                query: queryObject,
+                response: res,
+            });
+        });
+
+        server.get('/api/get_root_hash', (req, res) => {
+            const queryObject = req.query;
+            emitter.emit('get_root_hash', {
                 query: queryObject,
                 response: res,
             });

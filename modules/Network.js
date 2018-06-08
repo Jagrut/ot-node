@@ -7,13 +7,12 @@ const encoding = require('encoding-down');
 const kadence = require('@kadenceproject/kadence');
 const config = require('./Config');
 const async = require('async');
-const deasync = require('deasync-promise');
 const fs = require('fs');
-const node = require('./Node');
 const NetworkUtilities = require('./NetworkUtilities');
 const utilities = require('./Utilities');
+const PeerCache = require('./kademlia/PeerCache');
 
-let ns = {};
+let networkUtilities = {};
 
 /**
  * DHT module (Kademlia)
@@ -25,13 +24,11 @@ class Network {
     constructor(ctx) {
         this.emitter = ctx.emitter;
 
-        kadence.constants.T_RESPONSETIMEOUT = 20000;
-        kadence.constants.K = 20;
         if (parseInt(config.test_network, 10)) {
             kadence.constants.IDENTITY_DIFFICULTY = 2;
             kadence.constants.SOLUTION_DIFFICULTY = 2;
         }
-        ns = new NetworkUtilities();
+        networkUtilities = new NetworkUtilities();
         this.index = parseInt(config.child_derivation_index, 10);
 
         // Initialize private extended key
@@ -44,19 +41,19 @@ class Network {
      */
     async start() {
         // Check config
-        ns.verifyConfiguration(config);
+        networkUtilities.verifyConfiguration(config);
 
         log.info('Checking SSL certificate');
-        deasync(ns.setSelfSignedCertificate(config));
+        await networkUtilities.setSelfSignedCertificate(config);
 
         log.info('Getting the identity');
         this.xprivkey = fs.readFileSync(`${__dirname}/../keys/${config.private_extended_key_path}`).toString();
         this.identity = new kadence.eclipse.EclipseIdentity(this.xprivkey, this.index);
 
         log.info('Checking the identity');
-        ns.checkIdentity(this.identity, this.xprivkey); // Check if identity is valid
+        networkUtilities.checkIdentity(this.identity, this.xprivkey); // Check if identity is valid
 
-        const { childkey, parentkey } = ns.getIdentityKeys(this.xprivkey);
+        const { childkey, parentkey } = networkUtilities.getIdentityKeys(this.xprivkey);
         this.identity = kadence.utils.toPublicKeyHash(childkey.publicKey).toString('hex');
 
         log.notify(`My identity: ${this.identity}`);
@@ -83,7 +80,7 @@ class Network {
         const transport = new kadence.HTTPSTransport({ key, cert, ca });
 
         // Initialize protocol implementation
-        node.ot = new kadence.KademliaNode({
+        this.node = new kadence.KademliaNode({
             log,
             transport,
             identity: Buffer.from(this.identity, 'hex'),
@@ -100,11 +97,12 @@ class Network {
         log.info('Starting OT Node...');
 
         // Enable Quasar plugin used for publish/subscribe mechanism
-        node.ot.quasar = node.ot.plugin(kadence.quasar());
+        this.node.quasar = this.node.plugin(kadence.quasar());
+        this.node.peercache = this.node.plugin(PeerCache(`${__dirname}/../data/${config.embedded_peercache_path}`));
 
         // We use Hashcash for relaying messages to prevent abuse and make large scale
         // DoS and spam attacks cost prohibitive
-        // node.ot.hashcash = node.ot.plugin(kadence.hashcash({
+        // this.node.hashcash = this.node.plugin(kadence.hashcash({
         //     methods: ['PUBLISH', 'SUBSCRIBE', 'payload-sending'],
         //     difficulty: 10,
         // }));
@@ -121,20 +119,20 @@ class Network {
 
         // Use verbose logging if enabled
         if (parseInt(config.verbose_logging, 10)) {
-            node.ot.rpc.deserializer.append(new kadence.logger.IncomingMessage(log));
-            node.ot.rpc.serializer.prepend(new kadence.logger.OutgoingMessage(log));
+            this.node.rpc.deserializer.append(new kadence.logger.IncomingMessage(log));
+            this.node.rpc.serializer.prepend(new kadence.logger.OutgoingMessage(log));
         }
         // Cast network nodes to an array
         if (typeof config.network_bootstrap_nodes === 'string') {
             config.network_bootstrap_nodes = config.network_bootstrap_nodes.trim().split();
         }
 
-        node.ot.listen(parseInt(config.node_port, 10), () => {
-            log.notify(`OT Node listening at https://${node.ot.contact.hostname}:${node.ot.contact.port}`);
-            ns.registerControlInterface(config, node);
+        this.node.listen(parseInt(config.node_port, 10), () => {
+            log.notify(`OT Node listening at https://${this.node.contact.hostname}:${this.node.contact.port}`);
+            networkUtilities.registerControlInterface(config, this.node);
 
             if (parseInt(config.solve_hashes, 10)) {
-                ns.spawnHashSolverProcesses();
+                networkUtilities.spawnHashSolverProcesses(this.node);
             }
 
             async.retry({
@@ -147,29 +145,29 @@ class Network {
                 }
 
                 log.info(`Connected to network via ${entry[0]} (https://${entry[1].hostname}:${entry[1].port})`);
-                log.info(`Discovered ${node.ot.router.size} peers from seed`);
+                log.info(`Discovered ${this.node.router.size} peers from seed`);
             });
         });
     }
 
-    static enableNatTraversal() {
+    enableNatTraversal() {
         log.info('Trying NAT traversal');
-        node.ot.traverse = node.ot.plugin(kadence.traverse([
+        this.node.traverse = this.node.plugin(kadence.traverse([
             new kadence.traverse.UPNPStrategy({
                 mappingTtl: parseInt(config.traverse_port_forward_ttl, 10),
-                publicPort: parseInt(node.ot.contact.port, 10),
+                publicPort: parseInt(this.node.contact.port, 10),
             }),
             new kadence.traverse.NATPMPStrategy({
                 mappingTtl: parseInt(config.traverse_port_forward_ttl, 10),
-                publicPort: parseInt(node.ot.contact.port, 10),
+                publicPort: parseInt(this.node.contact.port, 10),
             }),
         ]));
     }
 
-    static enableOnion() {
+    enableOnion() {
         log.info('Use Tor for an anonymous overlay');
         kadence.constants.T_RESPONSETIMEOUT = 20000;
-        node.ot.onion = node.plugin(kadence.onion({
+        this.node.onion = this.node.plugin(kadence.onion({
             dataDirectory: `${__dirname}/../data/hidden_service`,
             virtualPort: config.onion_virtual_port,
             localMapping: `127.0.0.1:${config.node_port}`,
@@ -185,54 +183,49 @@ class Network {
     }
 
     /**
-     * Join network if there are some of the bootstrap nodes
+     * Try to join network
+     * Note: this method tries to find possible bootstrap nodes from cache as well
      */
     _joinNetwork(callback) {
         const bootstrapNodes = config.network_bootstrap_nodes;
-        if (bootstrapNodes.length === 0) {
-            log.warn('No bootstrap seeds provided and no known profiles');
-            log.trace('Running in seed mode (waiting for connections)');
-            return node.ot.router.events.once('add', (identity) => {
-                config.network_bootstrap_nodes = [
-                    kadence.utils.getContactURL([
-                        identity,
-                        node.ot.router.getContactByNodeId(identity),
-                    ]),
-                ];
-                this._joinNetwork(callback);
-            });
-        }
 
-        log.info(`Joining network from ${bootstrapNodes.length} seeds`);
-        async.detectSeries(bootstrapNodes, (url, done) => {
-            const contact = kadence.utils.parseContactURL(url);
-            node.ot.join(contact, (err) => {
-                done(null, (!err) && node.ot.router.size >= 1);
+        const peercachePlugin = this.node.peercache;
+        setTimeout(() => {
+            peercachePlugin.getBootstrapCandidates().then((peers) => {
+                log.info(`Found ${peers.length} possible bootstrap candidates from cache.`);
+                const nodes = peers.concat(bootstrapNodes);
+
+                log.info(`Joining network from ${nodes.length} seeds`);
+                async.detectSeries(nodes, (url, done) => {
+                    const contact = kadence.utils.parseContactURL(url);
+                    this.node.join(contact, (err) => {
+                        done(null, (!err) && this.node.router.size >= 1);
+                    });
+                }, (err, result) => {
+                    if (!result) {
+                        log.error('Failed to join network, will retry in 1 minute. Bootstrap node is probably not online.');
+                        callback(new Error('Failed to join network'));
+                    } else {
+                        log.important('Joined the network');
+                        const contact = kadence.utils.parseContactURL(result);
+                        callback(null, contact);
+                    }
+                });
             });
-        }, (err, result) => {
-            if (!result) {
-                log.error('Failed to join network, will retry in 1 minute. Bootstrap node is probably not online.');
-                callback(new Error('Failed to join network'));
-            } else {
-                log.important('Joined the network');
-                const contact = kadence.utils.parseContactURL(result);
-                config.dh = contact;
-                callback(null, contact);
-            }
-        });
+        }, 500); // this delay is needed because of the peercache
     }
 
     /**
      * Register Kademlia routes and error handlers
      */
     _registerRoutes() {
-        node.ot.quasar.quasarSubscribe('bidding-broadcast-channel', (message, err) => {
+        this.node.quasar.quasarSubscribe('bidding-broadcast-channel', (message, err) => {
             log.info('New bidding offer received');
             this.emitter.emit('bidding-broadcast', message);
         });
 
         // add payload-request route
-        node.ot.use('payload-request', (request, response, next) => {
+        this.node.use('payload-request', (request, response, next) => {
             log.info('payload-request received');
             this.emitter.emit('payload-request', request, response);
             response.send({
@@ -241,20 +234,20 @@ class Network {
         });
 
         // add payload-request error handler
-        node.ot.use('payload-request', (err, request, response, next) => {
+        this.node.use('payload-request', (err, request, response, next) => {
             response.send({
                 error: 'payload-request error',
             });
         });
 
         // add replication-request route
-        node.ot.use('replication-request', (request, response, next) => {
+        this.node.use('replication-request', (request, response, next) => {
             log.info('replication-request received');
             this.emitter.emit('replication-request', request, response);
         });
 
         // add replication-finished route
-        node.ot.use('replication-finished', (request, response, next) => {
+        this.node.use('replication-finished', (request, response, next) => {
             log.info('replication-finished received');
             this.emitter.emit('replication-finished', request);
             response.send({
@@ -263,27 +256,27 @@ class Network {
         });
 
         // add replication-finished error handler
-        node.ot.use('replication-finished', (err, request, response, next) => {
+        this.node.use('replication-finished', (err, request, response, next) => {
             response.send({
                 error: 'replication-finished error',
             });
         });
 
         // add challenge-request route
-        node.ot.use('challenge-request', (request, response, next) => {
+        this.node.use('challenge-request', (request, response, next) => {
             log.info('challenge-request received');
             this.emitter.emit('kad-challenge-request', request, response);
         });
 
         // add challenge-request error handler
-        node.ot.use('challenge-request', (err, request, response, next) => {
+        this.node.use('challenge-request', (err, request, response, next) => {
             response.send({
                 error: 'challenge-request error',
             });
         });
 
         // TODO remove temp add bid route
-        node.ot.use('add-bid', (request, response, next) => {
+        this.node.use('add-bid', (request, response, next) => {
             log.info('add-bid');
             const { bid } = request.params.message;
             [bid.dhId] = request.contact;
@@ -293,7 +286,7 @@ class Network {
         });
 
         // TODO remove temp add bid route
-        node.ot.use('add-bid', (err, request, response, next) => {
+        this.node.use('add-bid', (err, request, response, next) => {
             log.error('add-bid failed');
             response.send({
                 error: 'add-bid error',
@@ -301,20 +294,20 @@ class Network {
         });
 
         // add kad-bidding-won route
-        node.ot.use('kad-bidding-won', (request, response, next) => {
+        this.node.use('kad-bidding-won', (request, response, next) => {
             log.info('kad-bidding-won received');
             this.emitter.emit('kad-bidding-won', request, response);
         });
 
         // add kad-bidding-won error handler
-        node.ot.use('kad-bidding-won', (err, request, response, next) => {
+        this.node.use('kad-bidding-won', (err, request, response, next) => {
             response.send({
                 error: 'kad-bidding-won error',
             });
         });
 
         // creates Kadence plugin for RPC calls
-        node.ot.plugin((node) => {
+        this.node.plugin((node) => {
             /**
              * Helper method for getting nearest contact (used for testing purposes only)
              * @returns {*}
@@ -392,9 +385,13 @@ class Network {
             };
         });
         // Define a global custom error handler rule
-        node.ot.use((err, request, response, next) => {
+        this.node.use((err, request, response, next) => {
             response.send({ error: err.message });
         });
+    }
+
+    kademlia() {
+        return this.node;
     }
 }
 

@@ -1,8 +1,6 @@
 const Storage = require('./Database/SystemStorage');
 const Graph = require('./Graph');
-const GraphStorage = require('./GraphStorageInstance');
 const Challenge = require('./Challenge');
-const challenger = require('./Challenger');
 const Utilities = require('./Utilities');
 const BN = require('bn.js');
 const config = require('./Config');
@@ -18,18 +16,26 @@ class EventEmitter {
      * @param ctx IoC context
      */
     constructor(ctx) {
+        this.ctx = ctx;
         this.product = ctx.product;
+        this.graphStorage = ctx.graphStorage;
         this.globalEmitter = new events.EventEmitter();
     }
 
     /**
      * Initializes event listeners
-     * @param dcService
-     * @param dhService
-     * @param dataReplication
-     * @param importer
      */
-    initialize(dcService, dhService, dataReplication, importer) {
+    initialize() {
+        const {
+            dcService,
+            dhService,
+            dataReplication,
+            importer,
+            challenger,
+            blockchain,
+            product,
+        } = this.ctx;
+
         this.globalEmitter.on('import-request', (data) => {
             importer.importXML(data.filepath, (response) => {
                 // emit response
@@ -37,7 +43,7 @@ class EventEmitter {
         });
 
         this.globalEmitter.on('trail', (data) => {
-            this.product.p.getTrailByQuery(data.query).then((res) => {
+            product.getTrailByQuery(data.query).then((res) => {
                 data.response.send(res);
             }).catch(() => {
                 log.error(`Failed to get trail for query ${data.query}`);
@@ -45,13 +51,23 @@ class EventEmitter {
             });
         });
 
-        this.globalEmitter.on('gs1-import-request', async (data) => {
-            const response = await importer.importXMLgs1(data.filepath);
+        this.globalEmitter.on('get_root_hash', (data) => {
+            const dcWallet = data.query.dc_wallet;
+            const importId = data.query.import_id;
+            blockchain.getRootHash(dcWallet, importId).then((res) => {
+                data.response.send(res);
+            }).catch((err) => {
+                log.error(`Failed to get root hash for query ${data.query}`);
+                data.response.send(500); // TODO rethink about status codes
+            });
+        });
 
+        const processImport = async (response, error, data) => {
             if (response === null) {
+                data.response.status(error.status);
                 data.response.send({
-                    status: 500,
-                    message: 'Failed to parse XML.',
+                    status: error.status,
+                    message: error.message,
                 });
                 return;
             }
@@ -64,22 +80,62 @@ class EventEmitter {
             } = response;
 
             try {
-                await Storage.connect();
-                await Storage.runSystemQuery('INSERT INTO data_info (data_id, root_hash, import_timestamp, total_documents) values(?, ? , ? , ?)', [data_id, root_hash, total_documents]);
+                await Models.data_info
+                    .create({
+                        data_id, root_hash, import_timestamp: new Date(), total_documents,
+                    }).catch((error) => {
+                        log.error(error);
+                        data.response.send({
+                            status: 500,
+                            message: error,
+                        });
+                    });
+
+                data.response.send({
+                    status: 200,
+                    message: 'Ok.',
+                });
+
                 await dcService.createOffer(data_id, root_hash, total_documents, vertices);
             } catch (error) {
                 log.error(`Failed to start offer. Error ${error}.`);
                 data.response.send({
                     status: 500,
-                    message: 'Failed to parse XML.',
+                    message: error,
                 });
-                return;
             }
+        };
 
-            data.response.send({
-                status: 200,
-                message: 'Ok.',
-            });
+        this.globalEmitter.on('gs1-import-request', async (data) => {
+            try {
+                const responseObject = await importer.importXMLgs1(data.filepath);
+                const { error } = responseObject;
+                const { response } = responseObject;
+
+                if (response === null) {
+                    await processImport(null, error, data);
+                } else {
+                    await processImport(response, null, data);
+                }
+            } catch (error) {
+                await processImport(null, error, data);
+            }
+        });
+
+        this.globalEmitter.on('wot-import-request', async (data) => {
+            try {
+                const responseObject = await importer.importWOT(data.filepath);
+                const { error } = responseObject;
+                const { response } = responseObject;
+
+                if (response === null) {
+                    await processImport(null, error, data);
+                } else {
+                    await processImport(response, null, data);
+                }
+            } catch (error) {
+                await processImport(null, error, data);
+            }
         });
 
         this.globalEmitter.on('replication-request', async (request, response) => {
@@ -109,8 +165,8 @@ class EventEmitter {
 
             const offer = offerModel.get({ plain: true });
 
-            const verticesPromise = GraphStorage.db.findVerticesByImportId(offer.import_id);
-            const edgesPromise = GraphStorage.db.findEdgesByImportId(offer.import_id);
+            const verticesPromise = this.graphStorage.findVerticesByImportId(offer.import_id);
+            const edgesPromise = this.graphStorage.findEdgesByImportId(offer.import_id);
 
             Promise.all([verticesPromise, edgesPromise]).then((values) => {
                 const vertices = values[0];
@@ -159,7 +215,7 @@ class EventEmitter {
             log.trace(`Challenge arrived: Block ID ${request.params.message.payload.block_id}, Import ID ${request.params.message.payload.import_id}`);
             const challenge = request.params.message.payload;
 
-            GraphStorage.db.findVerticesByImportId(challenge.import_id).then((vertices) => {
+            this.graphStorage.findVerticesByImportId(challenge.import_id).then((vertices) => {
                 vertices = vertices.filter(vertex => vertex.vertex_type !== 'CLASS'); // Dump class objects.
                 const answer = Challenge.answerTestQuestion(challenge.block_id, vertices, 16);
                 log.trace(`Sending answer to question for import ID ${challenge.import_id}, block ID ${challenge.block_id}`);

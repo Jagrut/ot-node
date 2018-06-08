@@ -2,13 +2,16 @@
 const PythonShell = require('python-shell');
 const utilities = require('./Utilities');
 const Mtree = require('./mtree')();
-const GSdb = require('./GraphStorageInstance');
+const { Lock } = require('semaphore-async-await');
 
 const log = utilities.getLogger();
 
 class Importer {
     constructor(ctx) {
         this.gs1Importer = ctx.gs1Importer;
+        this.wotImporter = ctx.wotImporter;
+        this.graphStorage = ctx.graphStorage;
+        this.lock = new Lock();
     }
 
     async importJSON(json_document) {
@@ -21,11 +24,14 @@ class Importer {
 
         log.trace('Vertex importing');
 
+        await this.lock.acquire();
         // TODO: Use transaction here.
-        await Promise.all(vertices.map(vertex => GSdb.db.addVertex(vertex))
-            .concat(edges.map(edge => GSdb.db.addEdge(edge))));
-        await Promise.all(vertices.map(vertex => GSdb.db.updateImports('ot_vertices', vertex, import_id))
-            .concat(edges.map(edge => GSdb.db.updateImports('ot_edges', edge, import_id))));
+        await Promise.all(vertices.map(vertex => this.graphStorage.addVertex(vertex))
+            .concat(edges.map(edge => this.graphStorage.addEdge(edge))));
+        await Promise.all(vertices.map(vertex => this.graphStorage.updateImports('ot_vertices', vertex, import_id))
+            .concat(edges.map(edge => this.graphStorage.updateImports('ot_edges', edge, import_id))));
+
+        this.lock.release();
 
         log.info('JSON import complete');
     }
@@ -80,48 +86,79 @@ class Importer {
         });
     }
 
-    async importXMLgs1(ot_xml_document) {
-        try {
-            const result = await this.gs1Importer.parseGS1(ot_xml_document);
+    async afterImport(result) {
+        log.info('[DC] Import complete');
 
-            log.info('[DC] Import complete');
+        const { vertices } = result;
+        const { edges } = result;
+        const { import_id } = result;
 
-            const { vertices } = result;
-            const { edges } = result;
-            const { import_id } = result;
+        const leaves = [];
+        const hash_pairs = [];
 
-            const leaves = [];
-            const hash_pairs = [];
-
-            for (const i in vertices) {
-                leaves.push(utilities.sha3(utilities.sortObject({
+        for (const i in vertices) {
+            leaves.push(utilities.sha3(utilities.sortObject({
+                identifiers: vertices[i].identifiers,
+                data: vertices[i].data,
+            })));
+            hash_pairs.push({
+                key: vertices[i]._key,
+                hash: utilities.sha3({
                     identifiers: vertices[i].identifiers,
                     data: vertices[i].data,
-                })));
-                hash_pairs.push({
-                    key: vertices[i]._key,
-                    hash: utilities.sha3({
-                        identifiers: vertices[i].identifiers,
-                        data: vertices[i].data,
-                    }),
-                });
-            }
+                }),
+            });
+        }
 
-            const tree = new Mtree(hash_pairs);
-            const root_hash = utilities.sha3(tree.root());
+        const tree = new Mtree(hash_pairs);
+        const root_hash = utilities.sha3(tree.root());
 
-            log.info(`Import id: ${import_id}`);
-            log.info(`Import hash: ${root_hash}`);
+        log.info(`Import id: ${import_id}`);
+        log.info(`Import hash: ${root_hash}`);
+        return {
+            data_id: import_id,
+            root_hash,
+            total_documents: hash_pairs.length,
+            vertices,
+            edges,
+        };
+    }
+
+    async importWOT(document) {
+        try {
+            await this.lock.acquire();
+            const result = await this.wotImporter.parse(document);
+            this.lock.release();
+            return await this.afterImport(result);
+        } catch (error) {
+            log.error(`Import error: ${error}.`);
+            const errorObject = { message: error.toString(), status: error.status };
             return {
-                data_id: import_id,
-                root_hash,
-                total_documents: hash_pairs.length,
-                vertices,
-                edges,
+                response: null,
+                error: errorObject,
+            };
+        } finally {
+            this.lock.release();
+        }
+    }
+
+    async importXMLgs1(ot_xml_document) {
+        try {
+            await this.lock.acquire();
+            const result = await this.gs1Importer.parseGS1(ot_xml_document);
+            return {
+                response: await this.afterImport(result),
+                error: null,
             };
         } catch (error) {
-            log.error(`Failed to parse XML. Error ${error}.`);
-            return null;
+            log.error(`Import error: ${error}.`);
+            const errorObject = { message: error.toString(), status: error.status };
+            return {
+                response: null,
+                error: errorObject,
+            };
+        } finally {
+            this.lock.release();
         }
     }
 }
